@@ -8,14 +8,12 @@
 #include <memory>
 #include <mutex>
 #include <fstream>
-#include <sstream>
 #include <iterator>
 #include <sys/stat.h>
 #include <string>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
-#include <thread>
 #include <algorithm>
 #include <vector>
 #include <chrono>
@@ -80,14 +78,12 @@ struct SynTHBloKPlayer : Module, PlayerLinkProvider {
     std::mutex mu;
     std::shared_ptr<MidiSong> pending;
     std::atomic<bool> hasPending{false};
-    struct ScriptState { std::mutex m; std::string text = "CLICK TO PASTE"; bool busy = false; std::string loadPath, err; };
-    std::shared_ptr<ScriptState> script = std::make_shared<ScriptState>();
     std::string filePath, watchDir, status = "No file loaded";
     struct Part { std::shared_ptr<MidiSong> song; std::string path; int start; };
     std::vector<Part> parts;                          // every loaded file and the first track-out it sits on
     std::atomic<uint32_t> slotMask{0};                // track outs that have a file, for the panel
     std::string fileLabel;
-    std::string notice; double noticeUntil = 0.0;      // script messages shown on the OLED for a few seconds
+    std::string notice; double noticeUntil = 0.0;      // messages shown on the OLED for a few seconds
     bool autoPlay = false;
     std::vector<std::string> laneNamesUi;
     std::vector<double> clockUi;
@@ -276,7 +272,6 @@ struct SynTHBloKPlayer : Module, PlayerLinkProvider {
             pending.reset(); filePath.clear(); parts.clear(); slotMask = 0; fileLabel.clear(); laneNamesUi.clear(); lanesUi = 0; lengthUi = 0.0; bpmUi = 120.0;
             status = "No file loaded"; notice.clear();
         }
-        { std::lock_guard<std::mutex> g(script->m); if (!script->busy) script->text = "CLICK TO PASTE"; script->err.clear(); script->loadPath.clear(); }
         hasPending = true;
     }
 
@@ -613,142 +608,6 @@ static bool playerFolderDialog(SynTHBloKPlayer* m) {
     return true;
 }
 
-// ---------- paste-a-script: clipboard -> temp .py -> python -> .mid in the watch folder ----------
-static void playerRunClipboardScript(SynTHBloKPlayer* m) {
-    auto st = m->script;
-    auto setText = [st](const std::string& t, bool busy) { std::lock_guard<std::mutex> g(st->m); st->text = t; st->busy = busy; };
-    { std::lock_guard<std::mutex> g(st->m); if (st->busy) return; }
-    std::string dir;
-    { std::lock_guard<std::mutex> g(m->mu); dir = m->watchDir; }
-    if (dir.empty()) { setText("SET WATCH DIR", false); return; }
-    const char* clip = glfwGetClipboardString(APP->window->win);
-    std::string code = clip ? clip : "";
-    if (code.size() < 10) { setText("CLIPBOARD EMPTY", false); return; }
-    if (code.size() > 2000000) { setText("SCRIPT TOO BIG", false); return; }
-    std::string py = asset::user("SynTHBloK_pasted.py");
-    std::string log = asset::user("SynTHBloK_pasted.log");
-    {   // drop markdown code fences (``` or ```python) if the text was copied from a chat or web page
-        std::istringstream is(code); std::string line, outc;
-        while (std::getline(is, line)) {
-            std::string t = line; while (!t.empty() && (t.front() == ' ' || t.front() == '\t')) t.erase(t.begin());
-            if (t.compare(0, 3, "```") == 0) continue;
-            outc += line; outc += "\n";
-        }
-        code = outc;
-    }
-    { std::ofstream f(py, std::ios::binary); if (!f) { setText("CAN'T SAVE SCRIPT", false); return; } f << code; }
-    setText("SCRIPT PASTED", true);
-    std::thread([st, dir, py, log, setText]() {
-        double t0 = (double) std::time(nullptr) - 2.0;
-#ifdef ARCH_WIN
-        auto sh = [](const std::string& c) { return std::system(("\"" + c + "\"").c_str()); };
-        const std::string cdc = "cd /d \"" + dir + "\" && ";
-        const std::string quiet = " > nul 2>&1";
-        const char* cands[3] = {"python", "py -3", "python3"};
-#else
-        auto sh = [](const std::string& c) { return std::system(c.c_str()); };
-        const std::string cdc = "cd \"" + dir + "\" && ";
-        const std::string quiet = " > /dev/null 2>&1";
-        const char* cands[3] = {"python3", "python", "py -3"};
-#endif
-        std::string exe;
-        for (int i = 0; i < 3 && exe.empty(); i++)
-            if (sh(std::string(cands[i]) + " --version" + quiet) == 0) exe = cands[i];
-#ifdef ARCH_WIN
-        if (exe.empty()) {
-            const char* la2 = std::getenv("LOCALAPPDATA");
-            if (la2) {
-                std::string wa = std::string(la2) + "\\Microsoft\\WindowsApps\\python.exe";
-                if (system::isFile(wa) && sh("\"" + wa + "\" --version" + quiet) == 0) exe = "\"" + wa + "\"";
-            }
-        }
-        if (exe.empty()) {          // MSYS2's native Python (works from Rack without the MSYS2 shell)
-            for (const char* c : {"C:\\msys64\\mingw64\\bin\\python.exe", "C:\\msys64\\ucrt64\\bin\\python.exe", "C:\\msys64\\clang64\\bin\\python.exe"}) {
-                if (exe.empty() && system::isFile(c) && sh(std::string("\"") + c + "\" --version" + quiet) == 0) exe = std::string("\"") + c + "\"";
-            }
-        }
-        if (exe.empty()) {          // Rack may not see PATH changes: look in the usual install folders
-            std::vector<std::string> roots;
-            const char* la = std::getenv("LOCALAPPDATA");
-            if (la) roots.push_back(std::string(la) + "\\Python");             // Python 3.14 install manager
-            if (la) roots.push_back(std::string(la) + "\\Programs\\Python");
-            roots.push_back("C:\\Program Files\\Python");
-            roots.push_back("C:\\Program Files (x86)\\Python");
-            roots.push_back("C:\\");
-            for (const std::string& r : roots) {
-                try {
-                    std::vector<std::string> es = system::getEntries(r);
-                    std::sort(es.begin(), es.end());
-                    for (auto it = es.rbegin(); it != es.rend() && exe.empty(); ++it) {   // newest version first
-                        std::string base = system::getFilename(*it);
-                        if (base.size() < 6 || string::lowercase(base).compare(0, 6, "python") != 0) continue;
-                        std::string cand = "\"" + system::join(*it, "python.exe") + "\"";
-                        if (system::isFile(system::join(*it, "python.exe")) && sh(cand + " --version" + quiet) == 0) exe = cand;
-                    }
-                } catch (...) {}
-                if (!exe.empty()) break;
-            }
-        }
-#endif
-        if (exe.empty()) { setText("NO PYTHON FOUND", false); { std::lock_guard<std::mutex> g(st->m); st->err = "Python not found: install it from python.org (tick 'Add to PATH')"; } return; }
-
-        auto readLog = [&]() { std::ifstream f(log, std::ios::binary); return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>()); };
-        auto runIt = [&]() { setText("CONVERTING...", true); return sh(cdc + exe + " \"" + py + "\" > \"" + log + "\" 2>&1"); };
-
-        int rc = runIt();
-        std::string out = readLog();
-        for (int tries = 0; rc != 0 && tries < 2; tries++) {         // missing library? install it once and retry
-            size_t k = out.find("No module named '");
-            if (k == std::string::npos) break;
-            k += 17; size_t e = out.find('\'', k);
-            if (e == std::string::npos) break;
-            std::string mod = out.substr(k, e - k);
-            size_t dot = mod.find('.'); if (dot != std::string::npos) mod = mod.substr(0, dot);
-            bool ok = !mod.empty() && mod.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-") == std::string::npos;
-            if (!ok) break;
-            std::string pkg = mod;
-            if (mod == "pretty_midi") pkg = "pretty_midi"; else if (mod == "midiutil") pkg = "MIDIUtil";
-            setText("INSTALLING " + mod, true);
-            if (sh(cdc + exe + " -m pip install " + pkg + " > \"" + log + ".pip\" 2>&1") != 0) { setText("PIP FAILED: " + mod, false); std::lock_guard<std::mutex> g(st->m); st->err = "pip could not install " + pkg; return; }
-            rc = runIt(); out = readLog();
-        }
-        // collect new .mid files from the watch folder and one level of sub-folders (scripts often write into their own folder)
-        std::string newest; int bestScore = -1; double best = 0.0;
-        auto consider = [&](const std::string& e) {
-            std::string ext = string::lowercase(system::getExtension(e));
-            if (ext != ".mid" && ext != ".midi") return;
-            double tm = fileMTime(e);
-            if (tm < t0) return;
-            std::string up = string::uppercase(system::getFilename(e));
-            int score = up.find("FULL_ARRANGEMENT") != std::string::npos ? 2 : (up.find("ARRANGEMENT") != std::string::npos ? 1 : 0);
-            if (score > bestScore || (score == bestScore && tm >= best)) { newest = e; bestScore = score; best = tm; }
-        };
-        try {
-            for (const std::string& e : system::getEntries(dir)) {
-                if (system::isDirectory(e)) {
-                    try { for (const std::string& e2 : system::getEntries(e)) if (system::isFile(e2)) consider(e2); } catch (...) {}
-                } else if (system::isFile(e)) consider(e);
-            }
-        } catch (...) {}
-        if (rc != 0) {
-            std::string last, line;
-            std::istringstream is(out);
-            while (std::getline(is, line)) { while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back(); if (!line.empty()) last = line; }
-            setText("SCRIPT ERROR", false);
-            std::string where;
-            size_t ln = out.rfind(", line ");
-            if (ln != std::string::npos) { size_t e = ln + 7; while (e < out.size() && std::isdigit((unsigned char) out[e])) e++; where = "line " + out.substr(ln + 7, e - ln - 7) + ": "; }
-            std::lock_guard<std::mutex> g(st->m); st->err = last.empty() ? "Script failed" : where + last;
-        } else if (newest.empty()) {
-            setText("NO MIDI WRITTEN", false);
-            std::lock_guard<std::mutex> g(st->m); st->err = "Script ran but wrote no .mid into the watch folder";
-        } else {
-            setText("CONVERTED", false);
-            std::lock_guard<std::mutex> g(st->m); st->err.clear(); st->loadPath = newest;
-        }
-    }).detach();
-}
-
 // ---------- OLED display (same look as the FX module) ----------
 struct PlayerDisplay : TransparentWidget {
     SynTHBloKPlayer* module = nullptr;
@@ -885,7 +744,6 @@ struct PlayerButton : TransparentWidget {
     std::function<std::string()> dyn;
     float fs = 9.5f;
     bool hover = false;
-    std::function<void()> onPaste;
     std::function<void()> onClick;
     std::function<bool()> lit;
     std::shared_ptr<window::Font> font;
@@ -907,10 +765,6 @@ struct PlayerButton : TransparentWidget {
         nvgFillColor(a.vg, nvgRGBA(255, 200, 100, 255));
         nvgTextAlign(a.vg, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
         std::string t = dyn ? dyn() : label;
-        if (hover && onPaste && t == "CLICK TO PASTE") {          // idle + hovered: show a blinking cursor and the hint
-            bool blink = ((int) (system::getTime() * 2.0)) % 2 == 0;
-            t = blink ? "CLICK TO PASTE_" : "CLICK TO PASTE";
-        }
         nvgText(a.vg, box.size.x / 2, box.size.y / 2 + 0.5f, t.c_str(), nullptr);
     }
     void onButton(const event::Button& e) override {
@@ -922,12 +776,6 @@ struct PlayerButton : TransparentWidget {
     void onHover(const event::Hover& e) override { e.consume(this); }
     void onEnter(const event::Enter& e) override { hover = true; }
     void onLeave(const event::Leave& e) override { hover = false; }
-    void onHoverKey(const event::HoverKey& e) override {
-        if (onPaste && e.action == GLFW_PRESS && e.key == GLFW_KEY_V && (e.mods & RACK_MOD_MASK) == RACK_MOD_CTRL) {
-            onPaste();
-            e.consume(this);
-        }
-    }
 };
 
 // small OLED under the tempo knob: BPM now playing, EXT while a clock is patched in
@@ -1007,17 +855,13 @@ struct SynTHBloKPlayerWidget : ModuleWidget {
         bw->lit = [=]() { if (!module) return false; std::lock_guard<std::mutex> g(module->mu); return !module->watchDir.empty(); };
         addChild(bw);
 
-        // paste box: click = take the Python script from the clipboard and convert it; shows the state
+        // OPEN MIDI (Nov 12 2026): opens a .mid / .midi file (where the old paste-a-Python-script box was: removed, it ran
+        // clipboard text as a program). Files can also be dragged onto the module (onPathDrop).
         auto* bp = new PlayerButton();
         bp->fs = 6.5f;
         bp->box.pos = mm2px(Vec(35.f, 55.f)); bp->box.size = mm2px(Vec(21.96f, 5.2f));
-        bp->dyn = [=]() -> std::string {
-            if (!module) return "CLICK TO PASTE";
-            std::lock_guard<std::mutex> g(module->script->m); return module->script->text;
-        };
-        bp->lit = [=]() { if (!module) return false; std::lock_guard<std::mutex> g(module->script->m); return module->script->busy || module->script->text == "CONVERTED"; };
-        bp->onClick = [=]() { if (module) playerRunClipboardScript(module); };
-        bp->onPaste = bp->onClick;
+        bp->label = "OPEN MIDI";
+        bp->onClick = [=]() { if (module) playerLoadDialog(module); };
         addChild(bp);
 
         float y1 = 74.5f;
@@ -1076,12 +920,6 @@ struct SynTHBloKPlayerWidget : ModuleWidget {
         ModuleWidget::step();
         auto* m = dynamic_cast<SynTHBloKPlayer*>(module);
         if (!m) return;
-        {   // results from the paste-a-script worker
-            std::string lp, er;
-            { std::lock_guard<std::mutex> g(m->script->m); lp.swap(m->script->loadPath); er.swap(m->script->err); }
-            if (!er.empty()) { std::lock_guard<std::mutex> g(m->mu); m->notice = er; m->noticeUntil = system::getTime() + 10.0; }
-            if (!lp.empty()) { m->loadFile(lp); seenPath = lp; seenTime = fileMTime(lp); primed = true; pendPath.clear(); }
-        }
         if (++tick < 90) return;          // about every 1.5 s
         tick = 0;
         std::string dir;
